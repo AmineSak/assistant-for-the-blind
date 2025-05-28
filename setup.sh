@@ -15,7 +15,7 @@ wget https://nvidia.box.com/shared/static/p57jwntv436lfrd78inwl7iml6p13fzh.whl -
 pip install torch-1.8.0-cp36-cp36m-linux_aarch64.whl
 
 # Install additional Python packages
-pip install transformers==4.30.2 numpy==1.19.5 opencv-python==4.6.0.66 pygame==2.1.2 pyttsx3==2.90
+pip install transformers numpy opencv-python pygame pyttsx3
 
 # Install TTS (might take a while)
-pip install TTS==0.13.0
+pip install TTS

@@ -44,7 +44,7 @@ class SimpleBLIPDescriber:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model.to(self.device)
 
-        # Set to evaluation mode
+        # Set to evaluation modes
         self.model.eval()
         print(f"BLIP model loaded on {self.device}")
 
@@ -160,11 +160,11 @@ class SimpleBLIPDescriber:
                 if not text.strip():
                     continue
 
-                if self.engine:
-                    # Speak directly with pyttsx3
-                    self.engine.say(text)
-                    self.engine.runAndWait()
-                else:
+                # if self.engine:
+                #     # Speak directly with pyttsx3
+                #     self.engine.say(text)
+                self.engine.runAndWait()
+                if True:
                     # Fallback method - save to file and play with pygame
                     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                     audio_file = os.path.join(output_dir, f"desc_{timestamp}.wav")
