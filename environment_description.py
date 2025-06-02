@@ -1,307 +1,329 @@
-#!/usr/bin/env python3
 """
-Alternative implementation using a specific BLIP model with correct import structure
-to address the feature extractor issue
+Simplified real-time environment description system using BLIP vision model
 """
 
-import argparse
-import os
+import platform
 import queue
 import threading
 import time
-from datetime import datetime
 
 import cv2
-import pygame
+import pyttsx3
 import torch
 from PIL import Image
+from transformers import BlipForConditionalGeneration, BlipProcessor
 
 
-class SimpleBLIPDescriber:
+class RealTimeDescriber:
     def __init__(self):
+        # Initialize state variables first
+        self.running = False
+        self.current_frame = None
+        self.last_description = ""
+        self.last_description_time = 0
+        self.description_cooldown = 3.0  # seconds between descriptions
+        self.tts_queue = queue.Queue()
+        self.tts_thread = None
+
+        # Now setup components
         self.setup_model()
         self.setup_camera()
         self.setup_tts()
-        self.frame_queue = queue.Queue(maxsize=2)
-        self.text_queue = queue.Queue(maxsize=5)
-        self.running = False
-        self.last_description = ""
-        self.last_description_time = 0
-        pygame.mixer.init()
 
     def setup_model(self):
+        """Initialize BLIP model"""
         print("Loading BLIP model...")
-
-        # Import specific BLIP model classes
-        from transformers import BlipForConditionalGeneration, BlipProcessor
-
-        # Load model with specific class (not using AutoModel)
         model_name = "Salesforce/blip-image-captioning-base"
+
         self.processor = BlipProcessor.from_pretrained(model_name)
         self.model = BlipForConditionalGeneration.from_pretrained(model_name)
 
-        # Move to GPU if available
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # Use GPU if available
+        self.device = torch.device(
+            "mps" if torch.backends.mps.is_available() else "cpu"
+        )
         self.model.to(self.device)
-
-        # Set to evaluation modes
         self.model.eval()
-        print(f"BLIP model loaded on {self.device}")
+
+        print(f"Model loaded on {self.device}")
 
     def setup_camera(self):
-        print("Initializing camera...")
-        self.cap = cv2.VideoCapture(0)  # Use camera 0
+        """Initialize camera"""
+        print("Setting up camera...")
+        self.cap = cv2.VideoCapture(0)
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
         if not self.cap.isOpened():
-            raise RuntimeError("Failed to open camera")
-        print("Camera initialized")
+            raise RuntimeError("Could not open camera")
+        print("Camera ready")
 
     def setup_tts(self):
-        print("Setting up TTS (pyttsx3)...")
+        """Initialize text-to-speech"""
+        print("Setting up text-to-speech...")
         try:
-            import pyttsx3
-
-            self.engine = pyttsx3.init()
-            self.engine.setProperty("rate", 150)  # Speed
-            print("TTS initialized")
+            self.tts_engine = pyttsx3.init()
+            self.tts_engine.setProperty("rate", 150)
+            self.tts_available = True
+            print("TTS ready")
         except Exception as e:
-            print(f"Error initializing TTS: {e}")
-            self.engine = None
+            print(f"TTS setup failed: {e}")
+            self.tts_available = False
 
-    def capture_frames(self):
-        """Continuously capture frames from camera"""
-        print("Starting frame capture...")
-        while self.running:
-            ret, frame = self.cap.read()
-            if not ret:
-                print("Failed to capture frame, retrying...")
-                time.sleep(0.1)
-                continue
-
-            try:
-                if not self.frame_queue.full():
-                    self.frame_queue.put(frame, block=False)
-            except queue.Full:
-                pass
-
-    def process_frames(self):
-        """Process frames with vision model to generate descriptions"""
-        print("Starting frame processing...")
-
+    def _process_tts_queue(self):
+        """Process TTS queue in a separate thread"""
         while self.running:
             try:
-                frame = self.frame_queue.get(timeout=0.5)
+                # Get text from queue with timeout to allow checking running status
+                text = self.tts_queue.get(timeout=1.0)
+                if text is not None:
+                    print(f"Speaking: {text}")
+                    try:
+                        # Use a separate TTS engine instance for thread safety
+                        if platform.system().lower() == "darwin":
+                            engine = pyttsx3.init("nsss")
+                        else:
+                            engine = pyttsx3.init()
 
-                # Check if cooldown period has passed
-                current_time = time.time()
-                if current_time - self.last_description_time < 3.0:  # 3 second cooldown
-                    continue
+                        engine.setProperty("rate", 150)
+                        engine.say(text)
+                        engine.runAndWait()
 
-                # Convert to PIL Image
-                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                pil_image = Image.fromarray(rgb_frame)
+                        # No need to call engine.stop() after runAndWait()
+                        # runAndWait() already handles the engine lifecycle
 
-                # Generate caption with BLIP
-                with torch.no_grad():
-                    # Process image
-                    inputs = self.processor(pil_image, return_tensors="pt").to(
-                        self.device
-                    )
+                    except Exception as e:
+                        print(f"TTS speech error: {e}")
+                        # Try with the main engine as fallback
+                        try:
+                            if self.tts_available and hasattr(self, "tts_engine"):
+                                self.tts_engine.say(text)
+                                self.tts_engine.runAndWait()
+                        except Exception as fallback_error:
+                            print(f"TTS fallback also failed: {fallback_error}")
 
-                    # Generate caption
-                    output = self.model.generate(**inputs, max_length=50)
-                    caption = self.processor.decode(output[0], skip_special_tokens=True)
-
-                # Check if caption is different enough from last one
-                if self._is_different_enough(caption):
-                    print(f"New description: {caption}")
-                    self.last_description = caption
-                    self.last_description_time = current_time
-
-                    # Add to speech queue
-                    if not self.text_queue.full():
-                        self.text_queue.put(caption)
+                    self.tts_queue.task_done()
 
             except queue.Empty:
-                pass
+                continue
             except Exception as e:
-                print(f"Error processing frame: {e}")
-                time.sleep(0.1)
+                print(f"TTS queue processing error: {e}")
+                continue
 
-    def _is_different_enough(self, new_desc):
-        """Simple check if new description is different from previous"""
+    def capture_frame(self):
+        """Capture a single frame from camera"""
+        ret, frame = self.cap.read()
+        if ret:
+            self.current_frame = frame
+        return ret
+
+    def generate_description(self, frame):
+        """Generate description for the current frame"""
+        try:
+            # Convert frame to PIL Image
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            pil_image = Image.fromarray(rgb_frame)
+
+            # Process with BLIP using inference mode
+            with torch.inference_mode():
+                # Process image - let the processor handle tensor shapes properly
+                inputs = self.processor(images=pil_image, return_tensors="pt").to(
+                    self.device
+                )
+                print(f"Inputs: {len(inputs)}")
+
+                # Generate description
+                outputs = self.model.generate(
+                    **inputs,
+                    # max_length=50,
+                    num_beams=5,
+                    do_sample=False,
+                    early_stopping=True,
+                )
+
+                description = self.processor.decode(
+                    outputs[0], skip_special_tokens=True
+                )
+
+            return description.strip()
+
+        except Exception as e:
+            print(f"Error generating description: {e}")
+            return None
+
+    def is_description_different(self, new_desc):
+        """Check if new description is significantly different from the last one"""
         if not self.last_description:
             return True
 
-        common_words = set(new_desc.lower().split()) & set(
-            self.last_description.lower().split()
-        )
-        total_words = set(new_desc.lower().split()) | set(
-            self.last_description.lower().split()
-        )
+        # Simple word-based difference check
+        old_words = set(self.last_description.lower().split())
+        new_words = set(new_desc.lower().split())
 
-        if not total_words:
+        # Calculate overlap ratio
+        overlap = len(old_words.intersection(new_words))
+        total_unique = len(old_words.union(new_words))
+
+        if total_unique == 0:
             return False
 
-        difference_ratio = 1 - (len(common_words) / len(total_words))
-        return difference_ratio > 0.3  # Consider different if 30% words changed
+        similarity = overlap / total_unique
+        return similarity < 0.7  # Consider different if less than 70% similar
 
-    def speak_descriptions(self):
-        """Speak the generated descriptions"""
-        print("Starting speech synthesis...")
-        output_dir = "generated_audio"
-        os.makedirs(output_dir, exist_ok=True)
+    def speak_text(self, text):
+        """Add text to TTS queue"""
+        if not self.tts_available:
+            print("TTS not available")
+            return
 
+        try:
+            print(f"Queueing text for TTS: {text}")
+            self.tts_queue.put(text, timeout=1.0)
+        except queue.Full:
+            print("TTS queue is full, skipping this description")
+        except Exception as e:
+            print(f"Error queueing TTS: {e}")
+
+    def process_and_describe(self):
+        """Main processing loop for generating descriptions"""
         while self.running:
-            try:
-                text = self.text_queue.get(timeout=1.0)
+            current_time = time.time()
 
-                if not text.strip():
-                    continue
-
-                # if self.engine:
-                #     # Speak directly with pyttsx3
-                #     self.engine.say(text)
-                self.engine.runAndWait()
-                if True:
-                    # Fallback method - save to file and play with pygame
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    audio_file = os.path.join(output_dir, f"desc_{timestamp}.wav")
-
-                    # Try importing pyttsx3 again
-                    try:
-                        import pyttsx3
-
-                        temp_engine = pyttsx3.init()
-                        temp_engine.save_to_file(text, audio_file)
-                        temp_engine.runAndWait()
-
-                        # Play with pygame
-                        pygame.mixer.music.load(audio_file)
-                        pygame.mixer.music.play()
-                        while pygame.mixer.music.get_busy():
-                            pygame.time.Clock().tick(10)
-
-                        # Clean up
-                        os.remove(audio_file)
-                    except Exception as e:
-                        print(f"Speech synthesis failed: {e}")
-
-            except queue.Empty:
-                pass
-            except Exception as e:
-                print(f"Error in speech synthesis: {e}")
+            # Check cooldown period
+            if current_time - self.last_description_time < self.description_cooldown:
                 time.sleep(0.1)
+                continue
 
-    def display_frames(self):
-        """Show camera feed with descriptions"""
-        print("Starting display...")
+            if self.current_frame is not None:
+                # Generate description
+                description = self.generate_description(self.current_frame)
 
+                if description and self.is_description_different(description):
+                    print(f"Description: {description}")
+
+                    # Update tracking variables
+                    self.last_description = description
+                    self.last_description_time = current_time
+
+                    # Speak the description
+                    self.speak_text(description)
+
+            time.sleep(0.1)
+
+    def display_video(self):
+        """Display video feed with overlay text"""
         while self.running:
-            if not self.frame_queue.empty():
-                try:
-                    # Get a copy of the latest frame
-                    frame = self.frame_queue.queue[0].copy()
+            if not self.capture_frame():
+                print("Failed to capture frame")
+                time.sleep(0.1)
+                continue
 
-                    # Add description text
-                    if self.last_description:
-                        # Split into lines
-                        text = self.last_description
-                        max_width = frame.shape[1] - 20
-                        y_pos = 30
+            # Create display frame
+            display_frame = self.current_frame.copy()
 
-                        # Simple text wrapping
-                        words = text.split()
-                        lines = []
-                        current_line = []
+            # Add description text overlay
+            if self.last_description:
+                # Wrap text for display
+                words = self.last_description.split()
+                lines = []
+                current_line = []
+                max_chars_per_line = 50
 
-                        for word in words:
-                            test_line = " ".join(current_line + [word])
-                            if len(test_line) * 10 < max_width:  # Rough estimation
-                                current_line.append(word)
-                            else:
-                                lines.append(" ".join(current_line))
-                                current_line = [word]
-
+                for word in words:
+                    test_line = " ".join(current_line + [word])
+                    if len(test_line) <= max_chars_per_line:
+                        current_line.append(word)
+                    else:
                         if current_line:
                             lines.append(" ".join(current_line))
+                        current_line = [word]
 
-                        # Draw text lines
-                        for line in lines:
-                            cv2.putText(
-                                frame,
-                                line,
-                                (10, y_pos),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                0.7,
-                                (0, 255, 0),
-                                2,
-                            )
-                            y_pos += 30
+                if current_line:
+                    lines.append(" ".join(current_line))
 
-                    # Display
-                    cv2.imshow("Environment Description", frame)
+                # Draw text lines
+                y_offset = 30
+                for line in lines:
+                    cv2.putText(
+                        display_frame,
+                        line,
+                        (10, y_offset),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        (0, 255, 0),
+                        2,
+                    )
+                    y_offset += 30
 
-                    key = cv2.waitKey(1) & 0xFF
-                    if key == 27 or key == ord("q"):  # ESC or 'q'
-                        self.stop()
+            # Show frame
+            cv2.imshow("Real-time Environment Description", display_frame)
 
-                except Exception as e:
-                    print(f"Display error: {e}")
-
-        cv2.destroyAllWindows()
+            # Check for quit
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q") or key == 27:  # 'q' or ESC
+                self.stop()
+                break
 
     def start(self):
-        """Start all threads"""
+        """Start the real-time description system"""
+        print("Starting real-time environment describer...")
+        print("Press 'q' or ESC to quit")
+
         self.running = True
 
-        self.capture_thread = threading.Thread(target=self.capture_frames)
-        self.process_thread = threading.Thread(target=self.process_frames)
-        self.speech_thread = threading.Thread(target=self.speak_descriptions)
+        # Start TTS processing thread
+        if self.tts_available:
+            self.tts_thread = threading.Thread(
+                target=self._process_tts_queue, daemon=True
+            )
+            self.tts_thread.start()
+            print("TTS thread started")
 
-        self.capture_thread.start()
+        # Start description processing in background thread
+        self.process_thread = threading.Thread(
+            target=self.process_and_describe, daemon=True
+        )
         self.process_thread.start()
-        self.speech_thread.start()
 
-        # Run display in main thread
-        self.display_frames()
+        # Run video display in main thread
+        self.display_video()
 
     def stop(self):
-        """Stop all threads"""
+        """Stop the system"""
+        print("Stopping...")
         self.running = False
 
-        if hasattr(self, "capture_thread"):
-            self.capture_thread.join()
-        if hasattr(self, "process_thread"):
-            self.process_thread.join()
-        if hasattr(self, "speech_thread"):
-            self.speech_thread.join()
+        # Wait for TTS queue to empty with timeout
+        if self.tts_available and hasattr(self, "tts_queue"):
+            try:
+                # Add a None sentinel to signal the TTS thread to stop
+                self.tts_queue.put(None, timeout=1.0)
+                # Wait a bit for the queue to process
+                time.sleep(1.0)
+            except Exception as e:
+                print(f"Error while stopping TTS: {e}")
 
         if hasattr(self, "cap"):
             self.cap.release()
 
         cv2.destroyAllWindows()
-        print("System stopped")
+        print("Stopped")
 
 
 def main():
-    print("Starting simplified Environment Description System")
-    print(
-        f"Using device: {torch.device('cuda' if torch.cuda.is_available() else 'cpu')}"
-    )
+    """Main function"""
+    print("Real-time Environment Description System")
+    print("=" * 40)
 
     try:
-        system = SimpleBLIPDescriber()
-        system.start()
+        describer = RealTimeDescriber()
+        describer.start()
     except KeyboardInterrupt:
-        print("Keyboard interrupt received")
+        print("\nInterrupted by user")
     except Exception as e:
         print(f"Error: {e}")
     finally:
-        if "system" in locals():
-            system.stop()
-        print("System shut down")
+        print("Shutting down...")
 
 
 if __name__ == "__main__":
