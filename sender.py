@@ -1,34 +1,55 @@
 """
 Simplified real-time environment description system using BLIP vision model
+Sends descriptions via UDP to another PC for text-to-speech processing
+Optimized for Jetson Nano
 """
 
-import platform
-import queue
+import json
+import socket
 import threading
 import time
 
 import cv2
-import pyttsx3
 import torch
 from PIL import Image
 from transformers import BlipForConditionalGeneration, BlipProcessor
 
 
-class RealTimeDescriber:
-    def __init__(self):
+class RealTimeDescriberUDP:
+    def __init__(self, target_ip="192.168.1.100", target_port=12345):
         # Initialize state variables first
         self.running = False
         self.current_frame = None
         self.last_description = ""
         self.last_description_time = 0
         self.description_cooldown = 5.0  # seconds between descriptions
-        self.tts_queue = queue.Queue()
-        self.tts_thread = None
+
+        # UDP configuration
+        self.target_ip = target_ip
+        self.target_port = target_port
+        self.sock = None
 
         # Now setup components
+        self.setup_udp()
         self.setup_model()
         self.setup_camera()
-        self.setup_tts()
+
+    def setup_udp(self):
+        """Initialize UDP socket"""
+        print(f"Setting up UDP socket to {self.target_ip}:{self.target_port}")
+        try:
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            # Test connection
+            test_msg = json.dumps(
+                {"type": "test", "message": "Connection test from Jetson Nano"}
+            )
+            self.sock.sendto(
+                test_msg.encode("utf-8"), (self.target_ip, self.target_port)
+            )
+            print("UDP socket ready")
+        except Exception as e:
+            print(f"UDP setup failed: {e}")
+            print("Make sure the target PC is reachable and the receiver is running")
 
     def setup_model(self):
         """Initialize BLIP model"""
@@ -38,10 +59,14 @@ class RealTimeDescriber:
         self.processor = BlipProcessor.from_pretrained(model_name)
         self.model = BlipForConditionalGeneration.from_pretrained(model_name)
 
-        # Use GPU if available
-        self.device = torch.device(
-            "mps" if torch.backends.mps.is_available() else "cpu"
-        )
+        # Use GPU if available on Jetson Nano
+        if torch.cuda.is_available():
+            self.device = torch.device("cuda")
+            print("Using CUDA GPU")
+        else:
+            self.device = torch.device("cpu")
+            print("Using CPU")
+
         self.model.to(self.device)
         self.model.eval()
 
@@ -50,65 +75,29 @@ class RealTimeDescriber:
     def setup_camera(self):
         """Initialize camera"""
         print("Setting up camera...")
-        self.cap = cv2.VideoCapture(0)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        # Try different camera indices for Jetson Nano
+        for camera_index in [0, 1]:
+            self.cap = cv2.VideoCapture(camera_index)
+            if self.cap.isOpened():
+                break
 
         if not self.cap.isOpened():
+            # Try with gstreamer pipeline for Jetson Nano CSI camera
+            gst_pipeline = (
+                "nvarguscamerasrc ! "
+                "video/x-raw(memory:NVMM), width=640, height=480, format=NV12, framerate=30/1 ! "
+                "nvvidconv ! video/x-raw, format=BGRx ! "
+                "videoconvert ! video/x-raw, format=BGR ! appsink"
+            )
+            self.cap = cv2.VideoCapture(gst_pipeline, cv2.CAP_GSTREAMER)
+
+        if self.cap.isOpened():
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            self.cap.set(cv2.CAP_PROP_FPS, 30)
+            print("Camera ready")
+        else:
             raise RuntimeError("Could not open camera")
-        print("Camera ready")
-
-    def setup_tts(self):
-        """Initialize text-to-speech"""
-        print("Setting up text-to-speech...")
-        try:
-            self.tts_engine = pyttsx3.init()
-            self.tts_engine.setProperty("rate", 150)
-            self.tts_available = True
-            print("TTS ready")
-        except Exception as e:
-            print(f"TTS setup failed: {e}")
-            self.tts_available = False
-
-    def _process_tts_queue(self):
-        """Process TTS queue in a separate thread"""
-        while self.running:
-            try:
-                # Get text from queue with timeout to allow checking running status
-                text = self.tts_queue.get(timeout=1.0)
-                if text is not None:
-                    print(f"Speaking: {text}")
-                    try:
-                        # Use a separate TTS engine instance for thread safety
-                        if platform.system().lower() == "darwin":
-                            engine = pyttsx3.init("nsss")
-                        else:
-                            engine = pyttsx3.init()
-
-                        engine.setProperty("rate", 150)
-                        engine.say(text)
-                        engine.runAndWait()
-
-                        # No need to call engine.stop() after runAndWait()
-                        # runAndWait() already handles the engine lifecycle
-
-                    except Exception as e:
-                        print(f"TTS speech error: {e}")
-                        # Try with the main engine as fallback
-                        try:
-                            if self.tts_available and hasattr(self, "tts_engine"):
-                                self.tts_engine.say(text)
-                                self.tts_engine.runAndWait()
-                        except Exception as fallback_error:
-                            print(f"TTS fallback also failed: {fallback_error}")
-
-                    self.tts_queue.task_done()
-
-            except queue.Empty:
-                continue
-            except Exception as e:
-                print(f"TTS queue processing error: {e}")
-                continue
 
     def capture_frame(self):
         """Capture a single frame from camera"""
@@ -126,18 +115,18 @@ class RealTimeDescriber:
 
             # Process with BLIP using inference mode
             with torch.inference_mode():
-                # Process image - let the processor handle tensor shapes properly
+                # Process image
                 inputs = self.processor(
                     images=pil_image,
                     return_tensors="pt",
                     truncation=True,
                 ).to(self.device)
 
-                # Generate description
+                # Generate description with optimized parameters for Jetson Nano
                 outputs = self.model.generate(
                     **inputs,
-                    max_length=50,
-                    num_beams=5,
+                    max_length=30,  # Reduced for faster processing
+                    num_beams=3,  # Reduced for faster processing
                     do_sample=False,
                     early_stopping=True,
                 )
@@ -171,19 +160,32 @@ class RealTimeDescriber:
         similarity = overlap / total_unique
         return similarity < 0.7  # Consider different if less than 70% similar
 
-    def speak_text(self, text):
-        """Add text to TTS queue"""
-        if not self.tts_available:
-            print("TTS not available")
-            return
+    def send_description_udp(self, description):
+        """Send description via UDP"""
+        if not self.sock:
+            print("UDP socket not available")
+            return False
 
         try:
-            print(f"Queueing text for TTS: {text}")
-            self.tts_queue.put(text, timeout=1.0)
-        except queue.Full:
-            print("TTS queue is full, skipping this description")
+            # Create message with timestamp and description
+            message = {
+                "type": "description",
+                "text": description,
+                "timestamp": time.time(),
+                "source": "jetson_nano",
+            }
+
+            # Convert to JSON and send
+            json_msg = json.dumps(message)
+            self.sock.sendto(
+                json_msg.encode("utf-8"), (self.target_ip, self.target_port)
+            )
+            print(f"Sent via UDP: {description}")
+            return True
+
         except Exception as e:
-            print(f"Error queueing TTS: {e}")
+            print(f"Error sending UDP message: {e}")
+            return False
 
     def process_and_describe(self):
         """Main processing loop for generating descriptions"""
@@ -206,8 +208,8 @@ class RealTimeDescriber:
                     self.last_description = description
                     self.last_description_time = current_time
 
-                    # Speak the description
-                    self.speak_text(description)
+                    # Send description via UDP
+                    self.send_description_udp(description)
 
             time.sleep(0.1)
 
@@ -228,7 +230,7 @@ class RealTimeDescriber:
                 words = self.last_description.split()
                 lines = []
                 current_line = []
-                max_chars_per_line = 50
+                max_chars_per_line = 40
 
                 for word in words:
                     test_line = " ".join(current_line + [word])
@@ -243,21 +245,33 @@ class RealTimeDescriber:
                     lines.append(" ".join(current_line))
 
                 # Draw text lines
-                y_offset = 30
+                y_offset = 25
                 for line in lines:
                     cv2.putText(
                         display_frame,
                         line,
-                        (10, y_offset),
+                        (5, y_offset),
                         cv2.FONT_HERSHEY_SIMPLEX,
-                        0.7,
+                        0.6,
                         (0, 255, 0),
                         2,
                     )
-                    y_offset += 30
+                    y_offset += 25
+
+            # Add UDP status indicator
+            status_text = f"UDP -> {self.target_ip}:{self.target_port}"
+            cv2.putText(
+                display_frame,
+                status_text,
+                (5, display_frame.shape[0] - 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (255, 255, 0),
+                1,
+            )
 
             # Show frame
-            cv2.imshow("Real-time Environment Description", display_frame)
+            cv2.imshow("Jetson Nano - Environment Description", display_frame)
 
             # Check for quit
             key = cv2.waitKey(1) & 0xFF
@@ -267,18 +281,11 @@ class RealTimeDescriber:
 
     def start(self):
         """Start the real-time description system"""
-        print("Starting real-time environment describer...")
+        print("Starting Jetson Nano Environment Describer with UDP...")
+        print(f"Sending descriptions to {self.target_ip}:{self.target_port}")
         print("Press 'q' or ESC to quit")
 
         self.running = True
-
-        # Start TTS processing thread
-        if self.tts_available:
-            self.tts_thread = threading.Thread(
-                target=self._process_tts_queue, daemon=True
-            )
-            self.tts_thread.start()
-            print("TTS thread started")
 
         # Start description processing in background thread
         self.process_thread = threading.Thread(
@@ -294,15 +301,16 @@ class RealTimeDescriber:
         print("Stopping...")
         self.running = False
 
-        # Wait for TTS queue to empty with timeout
-        if self.tts_available and hasattr(self, "tts_queue"):
+        # Send stop message
+        if self.sock:
             try:
-                # Add a None sentinel to signal the TTS thread to stop
-                self.tts_queue.put(None, timeout=1.0)
-                # Wait a bit for the queue to process
-                time.sleep(1.0)
+                stop_msg = json.dumps({"type": "stop", "source": "jetson_nano"})
+                self.sock.sendto(
+                    stop_msg.encode("utf-8"), (self.target_ip, self.target_port)
+                )
+                self.sock.close()
             except Exception as e:
-                print(f"Error while stopping TTS: {e}")
+                print(f"Error closing UDP socket: {e}")
 
         if hasattr(self, "cap"):
             self.cap.release()
@@ -313,11 +321,22 @@ class RealTimeDescriber:
 
 def main():
     """Main function"""
-    print("Real-time Environment Description System")
-    print("=" * 40)
+    print("Jetson Nano Real-time Environment Description System with UDP")
+    print("=" * 55)
+
+    # Get target IP from user or use default
+    target_ip = input("Enter target PC IP address (default: 192.168.1.100): ").strip()
+    if not target_ip:
+        target_ip = "192.168.1.100"
+
+    target_port = input("Enter target port (default: 12345): ").strip()
+    if not target_port:
+        target_port = 12345
+    else:
+        target_port = int(target_port)
 
     try:
-        describer = RealTimeDescriber()
+        describer = RealTimeDescriberUDP(target_ip, target_port)
         describer.start()
     except KeyboardInterrupt:
         print("\nInterrupted by user")
