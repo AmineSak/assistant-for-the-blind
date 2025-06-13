@@ -60,9 +60,9 @@ class RealTimeDescriberUDP:
         self.model = BlipForConditionalGeneration.from_pretrained(model_name)
 
         # Use GPU if available on Jetson Nano
-        if torch.cuda.is_available():
-            self.device = torch.device("cuda")
-            print("Using CUDA GPU")
+        if torch.backends.mps.is_available():
+            self.device = torch.device("mps")
+            print("Using MPS GPU")
         else:
             self.device = torch.device("cpu")
             print("Using CPU")
